@@ -1,152 +1,175 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-# ──────────────────────────────────────────────────────────────
-# 1) Yêu cầu root
-# ──────────────────────────────────────────────────────────────
+# ==========================
+#   Cấu hình chung
+# ==========================
+N8N_DIR="/home/n8n"
+N8N_IMAGE="n8nio/n8n:latest"
+CADDY_IMAGE="caddy:2"
+TZ_DEFAULT="Europe/Berlin"
+
+# ==========================
+#   Tiện ích in thông báo
+# ==========================
+log()   { echo -e "\033[1;36m[INFO]\033[0m $*"; }
+warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
+error() { echo -e "\033[1;31m[ERROR]\033[0m $*"; }
+
+# ==========================
+#   Yêu cầu quyền root
+# ==========================
 if [[ $EUID -ne 0 ]]; then
-  echo "Script này cần chạy với quyền root"
+  error "Script này cần chạy với quyền root."
   exit 1
 fi
 
-# ──────────────────────────────────────────────────────────────
-# 2) Hỏi domain
-# ──────────────────────────────────────────────────────────────
-read -rp "Nhập domain hoặc subdomain của bạn (ví dụ: n8n.yourdomain.com): " DOMAIN
-DOMAIN=${DOMAIN,,} # về lowercase
+# ==========================
+#   Hỏi domain/subdomain
+# ==========================
+read -rp "Nhập domain hoặc subdomain cho n8n (vd: n8n.example.com): " DOMAIN
+DOMAIN=${DOMAIN,,}
+if [[ -z "${DOMAIN}" ]]; then
+  error "Domain rỗng."
+  exit 1
+fi
 
-# ──────────────────────────────────────────────────────────────
-# 3) Cài các gói cần thiết (curl, dig, lsb-release, gnupg…)
-# ──────────────────────────────────────────────────────────────
+# ==========================
+#   Gói nền
+# ==========================
 export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release dnsutils
+log "Cài gói nền..."
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg lsb-release dnsutils coreutils
 
-# ──────────────────────────────────────────────────────────────
-# 4) Kiểm tra domain → IP (IPv4)
-#    - Lấy IP public IPv4 của server
-#    - So với A records của DOMAIN
-# ──────────────────────────────────────────────────────────────
-check_domain() {
+# ==========================
+#   Cài/repair Docker + Compose
+# ==========================
+ensure_docker_and_compose() {
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker đã có: $(docker --version 2>/dev/null || true)"
+  else
+    log "Thêm repo Docker (keyring) và cài đặt..."
+    # Dọn key/repo cũ để tránh xung đột
+    rm -f /etc/apt/sources.list.d/docker.list \
+          /etc/apt/trusted.gpg.d/docker.gpg \
+          /usr/share/keyrings/docker-archive-keyring.gpg \
+          /etc/apt/keyrings/docker.gpg || true
+
+    install -m 0755 -d /etc/apt/keyrings
+    if curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+      chmod a+r /etc/apt/keyrings/docker.gpg
+      ARCH=$(dpkg --print-architecture)
+      CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+      echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${CODENAME} stable" \
+        > /etc/apt/sources.list.d/docker.list
+      apt-get update -y || true
+      if ! apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin; then
+        warn "Cài qua repo thất bại, chuyển sang convenience script."
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sh /tmp/get-docker.sh
+        apt-get install -y docker-compose-plugin || true
+      fi
+    else
+      warn "Không lấy được GPG key Docker. Dùng convenience script."
+      curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+      sh /tmp/get-docker.sh
+      apt-get install -y docker-compose-plugin || true
+    fi
+  fi
+
+  # Khởi động Docker daemon (ưu tiên systemd)
+  if ! docker version >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1; then
+      log "Bật dịch vụ docker (systemd)..."
+      systemctl enable --now docker || true
+      sleep 2
+    fi
+  fi
+
+  # Fallback khi không có systemd
+  if ! docker version >/dev/null 2>&1; then
+    warn "Có vẻ không có systemd. Khởi chạy dockerd nền..."
+    mkdir -p /var/run
+    nohup dockerd --host=unix:///var/run/docker.sock >/var/log/dockerd.nohup 2>&1 &
+    sleep 3
+    if ! docker version >/dev/null 2>&1; then
+      error "Docker daemon chưa chạy. Xem log: /var/log/dockerd.nohup"
+      exit 1
+    fi
+  fi
+
+  # Chọn Compose v2 nếu có, fallback v1
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_BIN="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    warn "Sử dụng docker-compose v1 (fallback)."
+    COMPOSE_BIN="docker-compose"
+  else
+    warn "Cài thêm docker-compose-plugin..."
+    apt-get install -y docker-compose-plugin || true
+    if docker compose version >/dev/null 2>&1; then
+      COMPOSE_BIN="docker compose"
+    else
+      error "Không tìm thấy docker compose."
+      exit 1
+    fi
+  fi
+  export COMPOSE_BIN
+  log "Sử dụng COMPOSE_BIN='${COMPOSE_BIN}'."
+}
+
+ensure_docker_and_compose
+
+# ==========================
+#   Check domain → IP
+# ==========================
+check_domain_ipv4() {
   local domain=$1
-  local server_ip
+  local server_ip domain_ips
   server_ip=$(curl -s4 https://api.ipify.org || true)
 
   if [[ -z "${server_ip}" ]]; then
-    echo "Không lấy được IP public của server (IPv4). Kiểm tra mạng?"
+    error "Không lấy được IP public IPv4 của server."
     return 1
   fi
 
-  # Lấy danh sách IPv4 A records (bỏ qua CNAME bằng cách hỏi trực tiếp bản ghi A)
-  local domain_ips
   domain_ips=$(dig +short A "${domain}" | sed '/^$/d' || true)
-
   if [[ -z "${domain_ips}" ]]; then
-    echo "Domain ${domain} hiện chưa có bản ghi A (IPv4)."
+    error "Domain ${domain} chưa có bản ghi A (IPv4)."
     return 1
   fi
 
-  # Kiểm tra có IP nào trùng server_ip không
   if echo "${domain_ips}" | grep -qx "${server_ip}"; then
+    log "Domain ${domain} đã trỏ đúng IP (${server_ip})."
     return 0
   else
-    echo "Cảnh báo: A records của ${domain} là:"
+    warn "A records của ${domain}:"
     echo "${domain_ips}"
-    echo "Nhưng IP máy này là: ${server_ip}"
+    warn "Nhưng IP máy này: ${server_ip}"
     return 1
   fi
 }
 
-if check_domain "${DOMAIN}"; then
-  echo "✅ Domain ${DOMAIN} đã trỏ đúng tới server này. Tiếp tục cài đặt…"
-else
-  echo "❌ Domain ${DOMAIN} chưa trỏ tới server này (IPv4)."
-  echo "→ Hãy trỏ bản ghi A của ${DOMAIN} về IP: $(curl -s4 https://api.ipify.org)"
-  echo "Sau khi cập nhật DNS (đợi DNS propagate), chạy lại script."
+if ! check_domain_ipv4 "${DOMAIN}"; then
+  error "Hãy trỏ bản ghi A của ${DOMAIN} về IP: $(curl -s4 https://api.ipify.org)"
   exit 1
 fi
 
-# ──────────────────────────────────────────────────────────────
-# 5) Cài Docker & Compose (ưu tiên convenience script + plugin v2)
-# ──────────────────────────────────────────────────────────────
-install_docker_and_compose() {
-  if command -v docker >/dev/null 2>&1; then
-    echo "Docker đã có sẵn: $(docker --version)"
-  else
-    echo "Cài Docker qua convenience script…"
-    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh || true
-    # Bật dịch vụ nếu có systemd
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl enable --now docker || true
-    fi
-  fi
-
-  # Nếu vẫn chưa có docker (repo fail), fallback về docker.io của Ubuntu
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "Fallback: cài docker.io từ repo Ubuntu…"
-    apt-get update
-    apt-get install -y docker.io || {
-      echo "Không cài được Docker. Kiểm tra mạng hoặc repo."
-      exit 1
-    }
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl enable --now docker || true
-    fi
-  fi
-
-  # Compose v2 plugin
-  if docker compose version >/dev/null 2>&1; then
-    echo "docker compose plugin đã sẵn sàng."
-  else
-    echo "Cài docker-compose-plugin…"
-    apt-get update
-    apt-get install -y docker-compose-plugin || true
-  fi
-
-  # Fallback cuối: nếu vẫn không có compose plugin, thử docker-compose v1
-  if ! docker compose version >/dev/null 2>&1; then
-    if command -v docker-compose >/dev/null 2>&1; then
-      echo "Sẽ dùng docker-compose (v1) làm fallback."
-      COMPOSE_BIN="docker-compose"
-    else
-      apt-get install -y docker-compose || true
-      if command -v docker-compose >/dev/null 2>&1; then
-        COMPOSE_BIN="docker-compose"
-      fi
-    fi
-  fi
-
-  # Mặc định dùng compose v2 nếu có
-  if docker compose version >/dev/null 2>&1; then
-    COMPOSE_BIN="docker compose"
-  fi
-
-  # Nếu không có cái nào -> báo lỗi
-  if [[ -z "${COMPOSE_BIN:-}" ]]; then
-    echo "Không tìm thấy docker compose (v2) hoặc docker-compose (v1)."
-    exit 1
-  fi
-
-  echo "Dùng COMPOSE_BIN='${COMPOSE_BIN}'"
-}
-
-install_docker_and_compose
-
-
-# ──────────────────────────────────────────────────────────────
-# 6) Chuẩn bị thư mục & file cấu hình
-# ──────────────────────────────────────────────────────────────
-N8N_DIR="/home/n8n"
+# ==========================
+#   Chuẩn bị thư mục/cấu hình
+# ==========================
+log "Tạo thư mục và file cấu hình n8n + Caddy..."
 mkdir -p "${N8N_DIR}/files"
 
-# Tạo ENCRYPTION KEY nếu chưa có
+# Tạo encryption key một lần
 if [[ ! -f "${N8N_DIR}/.encryption_key" ]]; then
   openssl rand -hex 24 > "${N8N_DIR}/.encryption_key"
 fi
 N8N_ENC_KEY=$(cat "${N8N_DIR}/.encryption_key")
 
-# Tạo file .env (expand biến!)
+# .env (expand biến!)
 cat > "${N8N_DIR}/.env" <<EOF
 # n8n base config
 N8N_HOST=${DOMAIN}
@@ -155,13 +178,10 @@ N8N_PROTOCOL=https
 N8N_PUBLIC_URL=https://${DOMAIN}/
 N8N_DEFAULT_BINARY_DATA_MODE=filesystem
 N8N_ENCRYPTION_KEY=${N8N_ENC_KEY}
-GENERIC_TIMEZONE=Europe/Berlin
-
-# Tuỳ chọn: tăng kích thước payload nếu cần
-# N8N_PAYLOAD_SIZE_MAX=64
+GENERIC_TIMEZONE=${TZ_DEFAULT}
 EOF
 
-# Tạo docker-compose.yml
+# docker-compose.yml (không expand biến ở đây)
 cat > "${N8N_DIR}/docker-compose.yml" <<'EOF'
 version: "3.8"
 services:
@@ -201,7 +221,7 @@ volumes:
   caddy_config:
 EOF
 
-# Tạo Caddyfile (expand biến!)
+# Caddyfile (expand biến!)
 cat > "${N8N_DIR}/Caddyfile" <<EOF
 ${DOMAIN} {
     encode gzip
@@ -210,47 +230,42 @@ ${DOMAIN} {
 }
 EOF
 
-# Quyền thư mục (n8n chạy với uid 1000 trong container)
+# Quyền (n8n chạy uid 1000 trong container)
 chown -R 1000:1000 "${N8N_DIR}/files"
 chmod -R 755 "${N8N_DIR}"
 
-# ──────────────────────────────────────────────────────────────
-# 7) Khởi động
-# ──────────────────────────────────────────────────────────────
-cd "${N8N_DIR}"
-${COMPOSE} up -d
-
-echo "Đợi container khởi động…"
-sleep 10
-
-# Kiểm tra trạng thái bằng compose
-echo "Kiểm tra container:"
-${COMPOSE} ps
-
-# Thử kiểm tra riêng service n8n có running không
-if ${COMPOSE} ps | grep -E 'n8n\s+running' >/dev/null 2>&1; then
-  echo "✅ n8n đang chạy."
-else
-  echo "❌ n8n chưa chạy. Xem log:"
-  ${COMPOSE} logs --no-color --tail=200 n8n || true
+# Mở firewall nếu có ufw
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
 fi
 
-# Kiểm tra Caddy
-if ${COMPOSE} ps | grep -E 'caddy\s+running' >/dev/null 2>&1; then
-  echo "✅ Caddy đang chạy."
-else
-  echo "❌ Caddy chưa chạy. Xem log:"
-  ${COMPOSE} logs --no-color --tail=200 caddy || true
+# ==========================
+#   Khởi chạy stack
+# ==========================
+log "Khởi chạy n8n + Caddy..."
+cd "${N8N_DIR}"
+${COMPOSE_BIN} pull
+${COMPOSE_BIN} up -d
+
+log "Đợi dịch vụ khởi động..."
+sleep 10
+${COMPOSE_BIN} ps
+
+# Thử in log ngắn nếu chưa running
+if ! ${COMPOSE_BIN} ps | grep -E 'n8n\s+.*(running|Up)' >/dev/null 2>&1; then
+  warn "n8n chưa running. Log gần nhất:"
+  ${COMPOSE_BIN} logs --tail=200 n8n || true
+fi
+if ! ${COMPOSE_BIN} ps | grep -E 'caddy\s+.*(running|Up)' >/dev/null 2>&1; then
+  warn "Caddy chưa running. Log gần nhất:"
+  ${COMPOSE_BIN} logs --tail=200 caddy || true
 fi
 
 echo ""
 echo "╔═════════════════════════════════════════════════════════════╗"
-echo "║                                                             ║"
 echo "║  ✅ n8n đã được cài đặt (hoặc đang khởi động).             ║"
-echo "║                                                             ║"
 echo "║  🌐 Truy cập: https://${DOMAIN}                             ║"
-echo "║                                                             ║"
-echo "║  ℹ️  Nếu HTTPS chưa lên ngay, đợi Caddy lấy cert vài phút. ║"
-echo "║                                                             ║"
+echo "║  ℹ️  Nếu HTTPS chưa lên ngay, chờ Caddy phát cert vài phút.║"
 echo "╚═════════════════════════════════════════════════════════════╝"
 echo ""
